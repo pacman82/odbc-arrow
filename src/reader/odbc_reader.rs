@@ -5,11 +5,66 @@ use arrow::{
     error::ArrowError,
     record_batch::{RecordBatch, RecordBatchReader},
 };
-use odbc_api::{buffers::ColumnarAnyBuffer, BlockCursor, Cursor};
+use futures_core::Stream;
+use odbc_api::{
+    buffers::ColumnarAnyBuffer, handles::AsStatementRef, BlockCursor, BlockCursorPolling, Cursor,
+    CursorPolling, Sleep,
+};
 
 use crate::{BufferAllocationOptions, ConcurrentOdbcReader, Error};
 
-use super::to_record_batch::ToRecordBatch;
+use super::{async_batched_odbc_reader::AsyncBatchedOdbcReader, to_record_batch::ToRecordBatch};
+
+// Async Arrow ODBC reader.
+pub struct AsyncOdbcReader<S: AsStatementRef> {
+    /// Converts the content of ODBC buffers into Arrow record batches
+    converter: ToRecordBatch,
+    /// Fetches values from the ODBC datasource using columnar batches. Values are streamed batch
+    /// by batch in order to avoid reallocation of the buffers used for tranistion.
+    cursor_polling: CursorPolling<S>,
+    /// We remember if the user decided to use fallibale allocations or not in case we need to
+    /// allocate another buffer due to a state transition towards [`AsyncBatchedOdbcReader`].
+    fallibale_allocations: bool,
+    max_rows_per_batch: usize,
+}
+
+impl<S: AsStatementRef> AsyncOdbcReader<S> {
+    /// Size of the internal preallocated buffer bound to the cursor and filled by your ODBC driver
+    /// in rows. Each record batch will at most have this many rows. Only the last one may have
+    /// less.
+    pub fn max_rows_per_batch(&self) -> usize {
+        self.max_rows_per_batch
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.converter.schema().clone()
+    }
+
+    pub fn into_stream<S2>(
+        self,
+        sleep: impl Fn() -> S2,
+    ) -> Result<impl Stream<Item = Result<RecordBatch, ArrowError>>, Error>
+    where
+        S2: Sleep,
+    {
+        Ok(AsyncBatchedOdbcReader::from_cursor_polling(
+            self.cursor_polling,
+            self.converter,
+            self.fallibale_allocations,
+            self.max_rows_per_batch,
+        )?
+        .into_stream(sleep))
+    }
+
+    pub fn into_batched(self) -> Result<AsyncBatchedOdbcReader<S>, Error> {
+        AsyncBatchedOdbcReader::from_cursor_polling(
+            self.cursor_polling,
+            self.converter,
+            self.fallibale_allocations,
+            self.max_rows_per_batch,
+        )
+    }
+}
 
 /// Arrow ODBC reader. Implements the [`arrow::record_batch::RecordBatchReader`] trait so it can be
 /// used to fill Arrow arrays from an ODBC data source.
@@ -367,6 +422,37 @@ impl OdbcReaderBuilder {
             converter,
             batch_stream,
             fallibale_allocations: self.fallibale_allocations,
+        })
+    }
+
+    pub async fn build_async<S, S2: Sleep>(
+        &self,
+        mut cursor: CursorPolling<S>,
+        sleep: impl Fn() -> S2,
+    ) -> Result<AsyncOdbcReader<S>, Error>
+    where
+        S: AsStatementRef,
+    {
+        let buffer_allocation_options = BufferAllocationOptions {
+            max_text_size: self.max_text_size,
+            max_binary_size: self.max_binary_size,
+            fallibale_allocations: self.fallibale_allocations,
+        };
+        let converter = ToRecordBatch::new_from_async(
+            &mut cursor,
+            self.schema.clone(),
+            buffer_allocation_options,
+            sleep,
+        )
+        .await?;
+        let bytes_per_row = converter.row_size_in_bytes();
+        let buffer_size_in_rows = self.buffer_size_in_rows(bytes_per_row)?;
+
+        Ok(AsyncOdbcReader {
+            converter,
+            cursor_polling: cursor,
+            fallibale_allocations: self.fallibale_allocations,
+            max_rows_per_batch: buffer_size_in_rows,
         })
     }
 }
